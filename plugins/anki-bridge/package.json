@@ -1,0 +1,16 @@
+{
+  "name": "@learnharness/anki-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "One-way push of LearnHarness graph flashcards into Anki via AnkiConnect.",
+  "license": "AGPL-3.0-only",
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "test": "node --test tests/*.test.cjs"
+  },
+  "devDependencies": {
+    "esbuild": "0.28.2",
+    "marked": "18.1.2"
+  }
+}

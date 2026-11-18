@@ -1,0 +1,11 @@
+{
+  "apiVersion": 1,
+  "id": "anki-bridge",
+  "name": "Anki Bridge",
+  "version": "0.1.0",
+  "minAppVersion": "0.6.1",
+  "description": "Generate recall cards from your knowledge graph and push them one-way into Anki through AnkiConnect. Generation uses your configured model and may incur cost.",
+  "main": "main.js",
+  "backend": "backend.cjs",
+  "styles": "styles.css"
+}
