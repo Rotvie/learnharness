@@ -93,13 +93,20 @@ function toAnkiHtml(markdown) {
   return html;
 }
 
-// Deck names: '::' nests decks in Anki; keep source titles as one level.
-function deckName(root, sourceTitle) {
-  // The root may nest on purpose (e.g. 'Study::LearnHarness'); source titles may not.
-  const clean = value => String(value ?? '').replace(/["\n\r\t]/g, ' ').replace(/\s+/g, ' ').trim();
-  const r = clean(root).split('::').map(part => part.trim()).filter(Boolean).join('::') || 'LearnHarness';
-  const s = clean(sourceTitle).replace(/::/g, ':') || 'Untitled source';
-  return `${r}::${s}`;
+const clean = value => String(value ?? '').replace(/["\n\r\t]/g, ' ').replace(/\s+/g, ' ').trim();
+
+// The target deck may nest on purpose (e.g. 'Study::LearnHarness').
+function deckName(deck) {
+  return clean(deck).split('::').map(part => part.trim()).filter(Boolean).join('::') || 'LearnHarness';
 }
 
-module.exports = { toAnkiHtml, extractMath, deckName, escapeHtml };
+// One hierarchical tag per source, e.g. learnharness::Álgebra_lineal. Tags cannot
+// contain spaces; Unicode is kept; '::' in a title would nest, so it becomes ':'.
+const TAG_ROOT = 'learnharness';
+function sourceTag(sourceTitle) {
+  const slug = clean(sourceTitle).replace(/::/g, ':').replace(/ /g, '_').replace(/^:+|:+$/g, '') || 'Untitled_source';
+  return `${TAG_ROOT}::${slug}`;
+}
+const tagsFor = sourceTitle => [TAG_ROOT, sourceTag(sourceTitle)];
+
+module.exports = { toAnkiHtml, extractMath, deckName, sourceTag, tagsFor, escapeHtml, TAG_ROOT };

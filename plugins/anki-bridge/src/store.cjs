@@ -16,10 +16,12 @@ function atomicWrite(file, content) {
   }
 }
 
-const defaults = () => ({ ankiUrl: 'http://127.0.0.1:8765', apiKey: '', rootDeck: 'LearnHarness', chunkBudget: 4000, modelOverride: null, struggleLapses: 3 });
+const defaults = () => ({ ankiUrl: 'http://127.0.0.1:8765', apiKey: '', deck: 'LearnHarness', chunkBudget: 4000, modelOverride: null, struggleLapses: 3 });
 
 // cards: { [id]: { id, propositionId, propositionName, sourceId, sourceTitle,
-//   question, answer, createdAt, updatedAt, ankiNoteId, pushedHash, pushedAt } }
+//   question, answer, createdAt, updatedAt, ankiNoteId, pushedHash, pushedAt,
+//   ankiHash (NFC hash of the note's fields in Anki as last pushed or kept),
+//   conflict: null | { at, question, answer } (Anki's edited HTML) } }
 function openStore(directory) {
   fs.mkdirSync(directory, { recursive: true });
   const file = path.join(directory, 'anki-bridge.json');
@@ -30,6 +32,11 @@ function openStore(directory) {
     state = { version: 1, revision: 0, settings: defaults(), cards: {}, batches: [] };
   }
   if (state.version !== 1 || !Number.isSafeInteger(state.revision) || !state.cards || typeof state.cards !== 'object' || !Array.isArray(state.batches) || !state.settings) throw new Error('Unsupported or invalid Anki Bridge data. No data was changed.');
+  // Earlier versions stored a root deck with one subdeck per source; it is now the single target deck.
+  if (Object.hasOwn(state.settings, 'rootDeck')) {
+    const { rootDeck, ...rest } = state.settings;
+    state.settings = { ...rest, deck: rest.deck ?? rootDeck };
+  }
   state.settings = { ...defaults(), ...state.settings };
   return {
     get: () => state,

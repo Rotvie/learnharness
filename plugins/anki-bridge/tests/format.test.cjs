@@ -1,7 +1,7 @@
 'use strict';
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
-const { toAnkiHtml, deckName } = require('../src/format.cjs');
+const { toAnkiHtml, deckName, sourceTag, tagsFor } = require('../src/format.cjs');
 
 test('plain single paragraph is unwrapped', () => {
   assert.equal(toAnkiHtml('What is **atomicity**?'), 'What is <strong>atomicity</strong>?');
@@ -52,8 +52,18 @@ test('safe links and math inside escaped HTML still render', () => {
   assert.equal(toAnkiHtml('<span>$x<y$</span>'), '&lt;span&gt;\\(x&lt;y\\)&lt;/span&gt;');
 });
 
-test('deck names nest one level per source; root may nest', () => {
-  assert.equal(deckName('LearnHarness', 'Linear algebra'), 'LearnHarness::Linear algebra');
-  assert.equal(deckName('Study :: LH', 'A::B "quoted"'), 'Study::LH::A:B quoted');
-  assert.equal(deckName('', ''), 'LearnHarness::Untitled source');
+test('deck name is the chosen deck, which may nest', () => {
+  assert.equal(deckName('Obsidian'), 'Obsidian');
+  assert.equal(deckName(' Study :: LH '), 'Study::LH');
+  assert.equal(deckName('"x"\n'), 'x');
+  assert.equal(deckName(''), 'LearnHarness');
+});
+
+test('source tags keep Unicode, use _ for spaces and never nest further', () => {
+  assert.equal(sourceTag('Álgebra lineal'), 'learnharness::Álgebra_lineal');
+  assert.equal(sourceTag('日本語 文法'), 'learnharness::日本語_文法');
+  assert.equal(sourceTag('A::B  "quoted"\tx'), 'learnharness::A:B_quoted_x');
+  assert.equal(sourceTag('::edge::'), 'learnharness::edge');
+  assert.equal(sourceTag(''), 'learnharness::Untitled_source');
+  assert.deepEqual(tagsFor('Notes.md'), ['learnharness', 'learnharness::Notes.md']);
 });

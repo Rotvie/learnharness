@@ -64,8 +64,14 @@ function fakeAnki() {
       case 'version': return reply(6);
       case 'deckNames': return reply([...anki.decks]);
       case 'modelNames': return reply(Object.keys(anki.models));
-      case 'modelFieldNames': return reply(anki.models[params.modelName] ?? null, anki.models[params.modelName] ? null : 'model was not found');
-      case 'createModel': anki.models[params.modelName] = params.inOrderFields; return reply({});
+      case 'modelFieldNames': return reply(anki.models[params.modelName]?.fields ?? null, anki.models[params.modelName] ? null : 'model was not found');
+      case 'createModel': anki.models[params.modelName] = { fields: params.inOrderFields, css: params.css, templates: Object.fromEntries(params.cardTemplates.map(t => [t.Name, { Front: t.Front, Back: t.Back }])) }; return reply({});
+      case 'modelTemplates': return reply(structuredClone(anki.models[params.modelName].templates));
+      case 'modelStyling': return reply({ css: anki.models[params.modelName].css });
+      case 'updateModelTemplates': Object.assign(anki.models[params.model.name].templates, structuredClone(params.model.templates)); return reply(null);
+      case 'updateModelStyling': anki.models[params.model.name].css = params.model.css; return reply(null);
+      case 'notesInfo': return reply(params.notes.map(id => { const n = anki.notes.get(id); return n ? { noteId: id, modelName: n.modelName, tags: [...n.tags], fields: Object.fromEntries(Object.entries(n.fields).map(([k, v], order) => [k, { value: v, order }])) } : {}; }));
+      case 'addTags': for (const id of params.notes) { const n = anki.notes.get(id); for (const tag of params.tags.split(' ')) if (!n.tags.includes(tag)) n.tags.push(tag); } return reply(null);
       case 'createDeck': anki.decks.add(params.deck); return reply(1);
       case 'findCards': {
         // Card id == note id in this fake; one card per note.
@@ -76,7 +82,7 @@ function fakeAnki() {
       case 'cardsInfo': return reply(params.cards.map(id => { const n = anki.notes.get(id); return { cardId: id, note: id, deckName: n.deckName, lapses: n.lapses ?? 0, fields: Object.fromEntries(Object.entries(n.fields).map(([k, v], order) => [k, { value: v, order }])) }; }));
       case 'findNotes': {
         const id = /"LHId:([^"]+)"/.exec(params.query)[1];
-        return reply([...anki.notes].filter(([, n]) => n.fields.LHId === id).map(([noteId]) => noteId));
+        return reply([...anki.notes].filter(([, n]) => n.modelName === 'LearnHarness' && n.fields.LHId === id).map(([noteId]) => noteId));
       }
       case 'addNote': {
         assert.ok(anki.decks.has(params.note.deckName), 'deck must exist');
@@ -128,20 +134,24 @@ function harness(t, initialGraph = graph('p1')) {
   return h;
 }
 
-test('generation stores cards per source; push creates note type, subdeck and notes', async t => {
+test('generation stores cards per source; push creates note type, deck and tagged notes', async t => {
   const h = harness(t, graph('p1', 'p2'));
   const state = await h.generate(cards('p1', 'What is $x^2$?'), cards('p2', 'Second?'));
   assert.equal(state.cards.length, 2);
-  assert.ok(state.cards.every(c => c.status === 'new' && c.deck === 'LearnHarness::Source lesson'));
+  assert.equal(state.deck, 'LearnHarness');
+  assert.ok(state.cards.every(c => c.status === 'new' && c.tag === 'learnharness::Source_lesson'));
   const { summary, state: after } = await h.call('push');
-  assert.deepEqual({ created: summary.created, updated: summary.updated, failed: summary.failed }, { created: 2, updated: 0, failed: [] });
-  assert.deepEqual(h.anki.models.LearnHarness, ['Question', 'Answer', 'Proposition', 'Source', 'LHId']);
-  assert.ok(h.anki.decks.has('LearnHarness::Source lesson'));
+  assert.deepEqual({ created: summary.created, updated: summary.updated, conflicts: summary.conflicts, failed: summary.failed }, { created: 2, updated: 0, conflicts: 0, failed: [] });
+  assert.deepEqual(h.anki.models.LearnHarness.fields, ['Question', 'Answer', 'Proposition', 'Source', 'LHId']);
+  assert.match(h.anki.models.LearnHarness.templates.Recall.Back, /\{\{#Proposition\}\}/);
+  assert.doesNotMatch(h.anki.models.LearnHarness.css, /background-color|color: black/);
+  assert.deepEqual([...h.anki.decks].sort(), ['Default', 'LearnHarness']);
   const note = [...h.anki.notes.values()].find(n => n.fields.Question.includes('x^2'));
+  assert.equal(note.deckName, 'LearnHarness');
   assert.equal(note.fields.Question, 'Topic: What is \\(x^2\\)?');
   assert.equal(note.fields.Proposition, 'Fact p1');
   assert.equal(note.fields.Source, 'Source lesson');
-  assert.deepEqual(note.tags, ['learnharness']);
+  assert.deepEqual(note.tags, ['learnharness', 'learnharness::Source_lesson']);
   assert.ok(after.cards.every(c => c.status === 'pushed' && c.ankiNoteId));
 });
 
@@ -196,16 +206,20 @@ test('API key is sent when configured', async t => {
 test('existing LearnHarness note type with wrong fields is refused', async t => {
   const h = harness(t);
   await h.generate(cards('p1', 'Q?'));
-  h.anki.models.LearnHarness = ['Front', 'Back'];
+  h.anki.models.LearnHarness = { fields: ['Front', 'Back'], templates: {}, css: '' };
   await assert.rejects(h.call('push'), /lacks fields: Question, Answer, Proposition, Source, LHId/);
 });
 
-test('root deck setting controls the subdeck and deleting a card is local only', async t => {
+test('deck setting picks an existing deck (no subdecks); list-decks; deleting a card is local only', async t => {
   const h = harness(t);
   const state = await h.generate(cards('p1', 'Q?'));
-  await h.call('save-settings', { rootDeck: 'Study::LH' });
+  h.anki.decks.add('Obsidian');
+  assert.deepEqual(await h.call('list-decks'), ['Default', 'Obsidian']);
+  await h.call('save-settings', { deck: ' Obsidian ' });
+  h.anki.calls.length = 0;
   await h.call('push');
-  assert.ok(h.anki.decks.has('Study::LH::Source lesson'));
+  assert.deepEqual([...h.anki.decks].sort(), ['Default', 'Obsidian']);
+  assert.equal([...h.anki.notes.values()][0].deckName, 'Obsidian');
   await h.call('delete-card', { id: state.cards[0].id });
   assert.equal(h.state().cards.length, 0); assert.equal(h.anki.notes.size, 1);
 });
@@ -237,7 +251,9 @@ test('prompt includes the formulation rules section', () => {
 test('settings validation', () => {
   assert.throws(() => validateSettings({ ankiUrl: 'ftp://x' }, defaults()), /http or https/);
   assert.throws(() => validateSettings({ ankiUrl: 'not a url' }, defaults()), /valid AnkiConnect URL/);
-  assert.throws(() => validateSettings({ rootDeck: ' :: ' }, defaults()), /Root deck/);
+  assert.throws(() => validateSettings({ deck: ' :: ' }, defaults()), /Anki deck must not be blank/);
+  assert.throws(() => validateSettings({ rootDeck: 'X' }, defaults()), /Unsupported setting/);
+  assert.equal(validateSettings({ deck: 'Study :: LH' }, defaults()).deck, 'Study::LH');
   assert.throws(() => validateSettings({ other: 1 }, defaults()), /Unsupported setting/);
   assert.equal(validateSettings({ ankiUrl: ' http://localhost:8765 ' }, defaults()).ankiUrl, 'http://localhost:8765');
 });
@@ -304,4 +320,121 @@ test('generation rejects cards breaking the formulation checks', async t => {
   assert.throws(() => h.workers.validate(one('What is closure?', 'x'), input), /rejected .*topic prefix/);
   assert.throws(() => h.workers.validate(one('Groups: axioms?', 'closure, associativity, identity and inverses'), input), /enumerates/);
   assert.doesNotThrow(() => h.workers.validate(one('Groups: axiom guaranteeing $a*b \\in G$?', 'closure'), input));
+});
+
+// Pushes p1's single card, then returns its Anki note.
+async function pushedNote(h, question = 'Q?') {
+  const state = await h.generate(cards('p1', question));
+  await h.call('push');
+  return { card: state.cards[0], note: [...h.anki.notes.values()][0], noteId: [...h.anki.notes.keys()][0] };
+}
+
+test('legacy rootDeck setting migrates to deck', async t => {
+  const h = harness(t);
+  const file = path.join(h.directory, 'anki-bridge.json');
+  const { deck, ...settings } = defaults();
+  fs.writeFileSync(file, JSON.stringify({ version: 1, revision: 3, settings: { ...settings, rootDeck: 'Obsidian' }, cards: {}, batches: [] }));
+  h.activate();
+  assert.equal(h.state().settings.deck, 'Obsidian');
+  assert.ok(!('rootDeck' in h.state().settings));
+});
+
+test('an untouched legacy note type is upgraded; a customized one is left with a notice', async t => {
+  const { LEGACY } = require('../src/anki-client.cjs');
+  const h = harness(t);
+  await h.generate(cards('p1', 'Q?'));
+  const legacy = () => ({ fields: ['Question', 'Answer', 'Proposition', 'Source', 'LHId'], css: LEGACY[0].css, templates: { Recall: { Front: LEGACY[0].Front, Back: LEGACY[0].Back } } });
+  h.anki.models.LearnHarness = legacy();
+  let { summary } = await h.call('push');
+  assert.equal(summary.notice, null);
+  assert.equal(h.anki.models.LearnHarness.templates.Recall.Front, '<div class="lh-q">{{Question}}</div>');
+  assert.doesNotMatch(h.anki.models.LearnHarness.css, /color: black/);
+
+  await h.generate(cards('p1', 'Q2?'));
+  h.anki.models.LearnHarness = legacy();
+  h.anki.models.LearnHarness.css += '\n.card { font-size: 30px; }';
+  h.anki.calls.length = 0;
+  ({ summary } = await h.call('push'));
+  assert.match(summary.notice, /customized in Anki/);
+  assert.match(h.anki.models.LearnHarness.css, /30px/);
+  assert.equal(h.anki.models.LearnHarness.templates.Recall.Front, LEGACY[0].Front);
+  assert.ok(!h.anki.calls.includes('updateModelTemplates') && !h.anki.calls.includes('updateModelStyling'));
+  assert.equal(summary.created, 1);
+});
+
+test('updating a legacy note adds the source tag without moving it', async t => {
+  const h = harness(t);
+  const { card, note } = await pushedNote(h);
+  note.tags = ['learnharness', 'mine']; note.deckName = 'LearnHarness::Source lesson';
+  await h.call('save-card', { id: card.id, question: q('Q, revised?'), answer: 'A' });
+  await h.call('push');
+  assert.deepEqual(note.tags, ['learnharness', 'mine', 'learnharness::Source_lesson']);
+  assert.equal(note.deckName, 'LearnHarness::Source lesson');
+});
+
+test('a note edited in Anki is not overwritten: conflict, then keep Anki version', async t => {
+  const h = harness(t);
+  const { card, note } = await pushedNote(h);
+  note.fields.Answer = 'Edited <b>in Anki</b>';
+  await h.call('save-card', { id: card.id, question: card.question, answer: 'Local edit' });
+  const { summary, state } = await h.call('push');
+  assert.deepEqual({ conflicts: summary.conflicts, updated: summary.updated }, { conflicts: 1, updated: 0 });
+  assert.equal(note.fields.Answer, 'Edited <b>in Anki</b>');
+  const conflicted = state.cards[0];
+  assert.equal(conflicted.status, 'conflict');
+  assert.equal(conflicted.conflict.answer, 'Edited <b>in Anki</b>');
+  assert.equal((await h.call('push')).summary.attempted, 0); // conflicts wait for a decision
+
+  const kept = await h.call('resolve-conflict', { id: card.id, keep: 'anki' });
+  assert.equal(kept.state.cards[0].status, 'pushed');
+  assert.equal(note.fields.Answer, 'Edited <b>in Anki</b>');
+  // A later local edit is pushed normally: Anki has not changed since it was kept.
+  await h.call('save-card', { id: card.id, question: card.question, answer: 'Second local edit' });
+  const again = await h.call('push');
+  assert.equal(again.summary.updated, 1);
+  assert.equal(note.fields.Answer, 'Second local edit');
+});
+
+test('conflict resolved by overwriting Anki', async t => {
+  const h = harness(t);
+  const { card, note } = await pushedNote(h);
+  note.fields.Question = 'Anki wording';
+  await h.call('save-card', { id: card.id, question: q('Local wording?'), answer: 'A' });
+  await h.call('push');
+  await assert.rejects(h.call('resolve-conflict', { id: card.id, keep: 'both' }), /Choose which version/);
+  const { summary, state } = await h.call('resolve-conflict', { id: card.id, keep: 'local' });
+  assert.equal(summary.updated, 1);
+  assert.equal(note.fields.Question, 'Topic: Local wording?');
+  assert.equal(state.cards[0].status, 'pushed');
+  await assert.rejects(h.call('resolve-conflict', { id: card.id, keep: 'local' }), /no conflict/);
+});
+
+test('unicode normalization by Anki is not mistaken for an edit', async t => {
+  const h = harness(t);
+  const { card, note } = await pushedNote(h, 'カ\u3099?'); // decomposed ガ
+  note.fields.Question = note.fields.Question.normalize('NFC');
+  await h.call('save-card', { id: card.id, question: card.question, answer: 'New' });
+  const { summary } = await h.call('push');
+  assert.deepEqual({ conflicts: summary.conflicts, updated: summary.updated }, { conflicts: 0, updated: 1 });
+});
+
+test('a note whose LHId was damaged is found by its note ID and repaired', async t => {
+  const h = harness(t);
+  const { card, note, noteId } = await pushedNote(h);
+  note.fields.LHId = 'oops';
+  await h.call('save-card', { id: card.id, question: q('Revised?'), answer: 'A' });
+  const { summary } = await h.call('push');
+  assert.deepEqual({ created: summary.created, updated: summary.updated, conflicts: summary.conflicts }, { created: 0, updated: 1, conflicts: 0 });
+  assert.equal(h.anki.notes.size, 1);
+  assert.equal(h.anki.notes.get(noteId).fields.LHId, card.id);
+});
+
+test('a stored note ID now holding another note type is not reused', async t => {
+  const h = harness(t);
+  const { card, note } = await pushedNote(h);
+  note.modelName = 'Basic';
+  await h.call('save-card', { id: card.id, question: q('Revised?'), answer: 'A' });
+  const { summary } = await h.call('push');
+  assert.equal(summary.created, 1);
+  assert.equal(h.anki.notes.size, 2);
 });

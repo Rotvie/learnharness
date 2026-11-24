@@ -8,7 +8,8 @@ const message = error => error instanceof Error ? error.message : String(error);
 const uuid = () => crypto.randomUUID();
 const ankiIcon = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="5" width="12" height="15" rx="2"/><path d="M9 3h10a2 2 0 0 1 2 2v11"/><path d="M15 12h6M18 9l3 3-3 3"/></svg>';
 const activeBatch = batch => batch && ['running', 'pending', 'queued', 'cancelling'].includes(batch.status);
-const STATUS_LABEL = { new: 'New', changed: 'Changed', pushed: 'In Anki' };
+const STATUS_LABEL = { new: 'New', changed: 'Changed', pushed: 'In Anki', conflict: 'Conflict' };
+const toPush = card => card.status === 'new' || card.status === 'changed';
 function lifetime(...parents) {
   const controller = new AbortController();
   const abort = () => controller.abort();
@@ -99,7 +100,17 @@ export function activate(ctx) {
   }
   function editCard(card, signal) {
     dialog('Edit card', signal, ({ root, actions, signal: ds, run, close }) => {
-      root.append(el('p', 'ab-muted', `${card.propositionName} · ${card.deck}`));
+      root.append(el('p', 'ab-muted', `${card.propositionName} · ${card.sourceTitle} · ${card.tag}`));
+      if (card.conflict) {
+        const box = el('section', 'ab-conflict');
+        box.append(el('p', '', 'This note was edited in Anki after its last push, so it was not overwritten. Anki currently has:'));
+        for (const [label, html] of [['Question', card.conflict.question], ['Answer', card.conflict.answer]]) box.append(el('span', 'ab-label', label), el('pre', 'ab-anki-html', html));
+        const choices = el('div', 'ab-actions');
+        const resolve = keep => run(async () => { const result = await ctx.call('resolve-conflict', { id: card.id, keep }); if (ds.aborted) return; publish(result.state); close(); });
+        button(choices, 'Overwrite Anki', resolve('local'), ds, { variant: 'destructive', title: 'Replace the Anki note with this card (review history is kept).' });
+        button(choices, 'Keep Anki version', resolve('anki'), ds, { title: 'Leave Anki as it is; this card counts as in sync until you edit it here again.' });
+        box.append(choices); root.append(box);
+      }
       const question = field(root, 'Question (Markdown)', card.question, 'textarea');
       const answer = field(root, 'Answer (Markdown)', card.answer, 'textarea');
       const preview = el('div', 'ab-preview'); root.append(preview);
@@ -138,7 +149,8 @@ export function activate(ctx) {
     const ankiPanel = el('section', 'ab-anki'), ankiStatus = el('p', 'ab-muted'), pushResult = el('div', 'ab-push-result');
     ankiStatus.setAttribute('role', 'status');
     const ankiActions = el('div', 'ab-actions');
-    ankiPanel.append(ankiActions, ankiStatus, pushResult);
+    const deckLine = el('p', 'ab-muted');
+    ankiPanel.append(ankiActions, deckLine, ankiStatus, pushResult);
     button(ankiActions, 'Test connection', guarded(async () => {
       ankiStatus.textContent = 'Connecting…';
       try {
@@ -188,14 +200,17 @@ export function activate(ctx) {
     function updateButtons() {
       const busy = !!activeBatch(snapshot?.batch);
       generationButton.update({ disabled: !generationIds.length || busy });
-      const pending = (snapshot?.cards ?? []).filter(c => c.status !== 'pushed').length;
+      const pending = (snapshot?.cards ?? []).filter(toPush).length;
       pushButton.update({ label: snapshot?.pushing ? 'Pushing…' : pending ? `Push ${pending} to Anki` : 'Push to Anki', disabled: !pending || !!snapshot?.pushing });
     }
     function renderPush(lastPush) {
       pushResult.replaceChildren();
+      const conflicts = (snapshot?.cards ?? []).filter(c => c.status === 'conflict').length;
+      if (conflicts) pushResult.append(el('p', 'ab-error', `${conflicts} ${conflicts === 1 ? 'card was' : 'cards were'} edited in Anki and not overwritten. Open a card marked Conflict to choose a version.`));
       if (!lastPush) return;
       if (lastPush.error) { pushResult.append(el('p', 'ab-error', `Push failed: ${lastPush.error}`)); return; }
-      pushResult.append(el('p', 'ab-muted', `Last push: ${lastPush.created} created, ${lastPush.updated} updated, ${lastPush.failed.length} failed.`));
+      pushResult.append(el('p', 'ab-muted', `Last push: ${lastPush.created} created, ${lastPush.updated} updated, ${lastPush.conflicts ?? 0} conflicts, ${lastPush.failed.length} failed.`));
+      if (lastPush.notice) pushResult.append(el('p', 'ab-muted', lastPush.notice));
       const names = new Map((snapshot?.cards ?? []).map(c => [c.id, c.question]));
       for (const f of lastPush.failed.slice(0, 10)) pushResult.append(el('p', 'ab-error', `${(names.get(f.cardId) || f.cardId).slice(0, 80)}: ${f.error}`));
     }
@@ -213,7 +228,7 @@ export function activate(ctx) {
       if (batch.error) button(controls, 'Retry saving', guarded(() => mutate('resume-results', {}, signal)), bs);
     }
 
-    // Tree: Anki deck (one per source) → card.
+    // Tree: source (one learnharness::<source> tag each) → card.
     const expanded = new Set(), factories = new Map(), records = new Map();
     function cardContent(key) {
       if (factories.has(key)) return factories.get(key);
@@ -232,19 +247,19 @@ export function activate(ctx) {
     const tree = widget(ctx.ui.mountTree(treeSlot, { label: 'Anki Bridge cards', header: 'Card', rows: [], columns: [{ key: 'status', header: 'Status', width: '6rem', align: 'right' }] }, { signal }), signal);
     function renderTree(state) {
       const groups = new Map();
-      for (const card of state.cards) { if (!groups.has(card.deck)) groups.set(card.deck, []); groups.get(card.deck).push(card); }
-      const rows = [...groups].map(([deck, cards]) => {
-        const key = `deck:${deck}`;
-        const pending = cards.filter(c => c.status !== 'pushed').length;
+      for (const card of state.cards) { if (!groups.has(card.tag)) groups.set(card.tag, []); groups.get(card.tag).push(card); }
+      const rows = [...groups].map(([tag, cards]) => {
+        const key = `tag:${tag}`;
+        const pending = cards.filter(toPush).length, conflicts = cards.filter(c => c.status === 'conflict').length;
         return {
-          key, content: deck,
-          cells: { status: pending ? `${pending} to push` : 'In Anki' },
+          key, content: cards[0].sourceTitle || tag,
+          cells: { status: conflicts ? `${conflicts} conflict${conflicts === 1 ? '' : 's'}` : pending ? `${pending} to push` : 'In Anki' },
           children: cards.map(card => {
             const cardKey = `card:${card.id}`;
             if (records.has(cardKey)) { records.get(cardKey).card = card; records.get(cardKey).refresh?.(); } else records.set(cardKey, { card });
             return { key: cardKey, content: cardContent(cardKey), cells: { status: STATUS_LABEL[card.status] } };
           }),
-          disclosure: { label: `Toggle ${deck}`, expanded: expanded.has(key), onChange(value) { if (value) expanded.add(key); else expanded.delete(key); renderTree(snapshot); } },
+          disclosure: { label: `Toggle ${tag}`, expanded: expanded.has(key), onChange(value) { if (value) expanded.add(key); else expanded.delete(key); renderTree(snapshot); } },
         };
       });
       tree.update({ rows });
@@ -254,6 +269,7 @@ export function activate(ctx) {
 
     observe((state, loadError) => {
       if (signal.aborted) return; if (loadError) { showError(loadError); return; }
+      deckLine.textContent = `New notes go to deck "${state.deck}", tagged learnharness::<source>.`;
       updateButtons(); renderBatch(state.batch); renderPush(state.lastPush); renderTree(state);
     }, signal);
     return () => { scope.abort(); root.remove(); };
@@ -264,7 +280,7 @@ export function activate(ctx) {
     const root = el('div', 'ab-root ab-settings'), error = el('p', 'ab-error'), fields = el('div'), modelArea = el('div', 'ab-model-settings');
     error.setAttribute('role', 'alert'); root.append(fields, modelArea, error); container.append(root);
     let initialized = false, rows, followRows, modelPicker, thinkingPicker, modelPickers, catalog = null;
-    let overrideDraft = false, modelBusy = false;
+    let overrideDraft = false, modelBusy = false, decks = null;
     const followingCheap = settings => !overrideDraft && !settings.modelOverride && settings.thinkingOverride == null;
     const showError = cause => { if (!signal.aborted) error.textContent = message(cause); };
     const save = async patch => {
@@ -276,7 +292,9 @@ export function activate(ctx) {
       return [
         row('ankiUrl', 'AnkiConnect URL', settings.ankiUrl, 'text'),
         row('apiKey', 'AnkiConnect API key (optional, stored locally)', settings.apiKey, 'text'),
-        row('rootDeck', 'Root Anki deck (one subdeck per source)', settings.rootDeck, 'text'),
+        decks
+          ? row('deck', 'Anki deck for new notes', settings.deck, 'dropdown', value => value, { options: [...new Set([settings.deck, ...decks])].map(name => ({ value: name, label: name })) })
+          : row('deck', 'Anki deck for new notes', settings.deck, 'text', value => value, { description: 'Open Anki to pick from your decks. A deck that does not exist is created.' }),
         row('chunkBudget', 'Generation chunk budget (estimated tokens)', settings.chunkBudget, 'number', Number, { min: 1, step: 1 }),
         row('struggleLapses', 'Struggle lapse threshold (leech tag always counts)', settings.struggleLapses, 'number', Number, { min: 1, max: 100, step: 1 }),
       ];
@@ -314,6 +332,7 @@ export function activate(ctx) {
         if (typeof ctx.ui.mountModelPicker === 'function') modelPicker = widget(ctx.ui.mountModelPicker(modelSlot, { value: state.settings.modelOverride || undefined, onChange: async value => { try { await changeModels({ modelOverride: value, thinkingOverride: null }); } catch { /* error shown */ } } }, { signal }), signal);
         if (typeof ctx.ui.mountThinkingPicker === 'function') thinkingPicker = widget(ctx.ui.mountThinkingPicker(thinkingSlot, { model: state.settings.modelOverride || undefined, value: state.settings.thinkingOverride ?? undefined, onChange: async value => { try { await changeModels({ thinkingOverride: value }); } catch { /* error shown */ } } }, { signal }), signal);
         updateModels(state.settings);
+        void ctx.call('list-decks').then(value => { if (!signal.aborted) { decks = value; rows.update({ rows: settingsRows(snapshot.settings) }); } }).catch(() => { /* Anki closed: free-text deck */ });
         void ctx.call('get-catalog').then(value => { if (!signal.aborted) { catalog = value; updateModels(snapshot.settings); } }).catch(showError);
       } else { rows.update({ rows: settingsRows(state.settings) }); updateModels(state.settings); }
     }, signal);

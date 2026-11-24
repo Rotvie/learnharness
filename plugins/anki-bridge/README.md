@@ -29,17 +29,25 @@ Copy `<plugins-directory>` from **Settings → Community plugins**, then Refresh
 
 1. Open **Anki Bridge** from the sidebar.
 2. Pick propositions with the knowledge picker, press **Generate**, confirm the token estimate.
-3. Cards appear grouped by their Anki deck. Click a card to edit it or delete it.
+3. Cards appear grouped by source. Click a card to edit it or delete it.
 4. **Test connection**, then **Push N to Anki**.
+
+Pick the target deck in this plugin's settings: with Anki open it is a list of your decks
+(for example your existing `Obsidian` deck); with Anki closed it is a text field.
 
 ## How cards land in Anki
 
 - **Note type** `LearnHarness`, created on first push. Fields: `Question`, `Answer`,
-  `Proposition`, `Source`, `LHId`. Single card template "Recall".
+  `Proposition`, `Source`, `LHId`. Single card template "Recall". No fixed colors, so Anki's
+  light/dark theme applies; the proposition/source context shows only when present.
   If a note type with that name already exists without these fields, push is refused.
-- **Deck** `<root>::<source title>`, one subdeck per LearnHarness source (teaching session or
-  imported notes file). Root defaults to `LearnHarness` and may itself nest (`Study::LH`).
-- **Tag** `learnharness`.
+  A note type still exactly like the earlier template is upgraded on push; one you customized in
+  Anki is left unchanged and the push result says so.
+- **Deck**: the single deck chosen in settings (default `LearnHarness`; may nest, e.g.
+  `Study::LH`). No subdecks are created. A deck that does not exist yet is created.
+- **Tags** `learnharness` and `learnharness::<source>` (one per LearnHarness source: teaching
+  session or imported notes file). Spaces become `_`; accents and Japanese are kept. Browse
+  them in Anki's sidebar, or search `tag:learnharness::Álgebra_lineal`.
 - **Formatting**: Markdown → HTML; `$…$` → `\(…\)` and `$$…$$` → `\[…\]` for Anki's built-in
   MathJax. Generation forbids Mermaid, images and raw HTML.
 
@@ -70,21 +78,27 @@ practice continues. Nothing is written to Anki or to learning records.
 
 ## Re-push behavior
 
-Each card's identity is its `LHId`. Status is **New**, **Changed** (edited since its last push)
-or **In Anki**. Pushing sends New and Changed cards only:
+Each card's identity is its `LHId` (with the Anki note ID recorded at push as a fallback, so a
+damaged `LHId` is found and repaired). Status is **New**, **Changed** (edited since its last
+push), **In Anki** or **Conflict**. Pushing sends New and Changed cards only:
 
-- note with that `LHId` exists → fields updated in place; Anki review history is kept;
+- note exists and is unchanged in Anki since the last push → fields updated in place, source
+  tag added; Anki review history is kept;
+- note exists but was **edited in Anki** → left untouched; the card becomes **Conflict**. Open
+  it to see Anki's version and choose **Overwrite Anki** or **Keep Anki version** (the card then
+  counts as in sync until you edit it here again);
 - note missing (never pushed, or deleted in Anki) → created again.
 
-Moving a note to another deck in Anki is kept: updates do not move notes. Changing the root
-deck setting only affects newly created notes. Deleting a card in Anki Bridge does **not**
-delete its Anki note. Edits made inside Anki are overwritten when that card is next pushed
-as Changed.
+Moving a note to another deck in Anki is kept: updates never move notes, and notes created by
+the earlier version stay in their per-source subdecks (they gain the source tag when next pushed). Tags are
+only added, never removed. Changing the deck setting only affects newly created notes.
+Deleting a card in Anki Bridge does **not** delete its Anki note.
 
 ## Settings
 
 AnkiConnect URL (default `http://127.0.0.1:8765`), optional AnkiConnect API key (stored in
-plain text in plugin data), root deck, generation chunk budget, model/thinking override.
+plain text in plugin data), Anki deck for new notes, generation chunk budget, struggle lapse
+threshold, model/thinking override.
 
 ## Data
 

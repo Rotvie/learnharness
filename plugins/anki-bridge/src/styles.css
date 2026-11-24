@@ -28,3 +28,6 @@
 .ab-root .ab-struggle-list { margin: 8px 0 0; padding-left: 18px; }
 .ab-root .ab-struggle-list > li { margin-bottom: 6px; }
 .ab-root .ab-struggle-cards { margin: 2px 0 0; padding-left: 16px; }
+
+.ab-root .ab-conflict { margin: 12px 0; padding: 12px; border: 1px solid var(--destructive, #dc5555); border-radius: 10px; }
+.ab-root .ab-anki-html { white-space: pre-wrap; word-break: break-word; font-size: 12px; margin: .25rem 0 .5rem; padding: .4rem; border-radius: 4px; background: rgba(127,127,127,.12); }

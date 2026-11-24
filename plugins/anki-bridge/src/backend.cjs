@@ -3,8 +3,8 @@ const { randomUUID, createHash } = require('node:crypto');
 const path = require('node:path');
 const { openStore } = require('./store.cjs');
 const { instructions, promptFor } = require('./generation-prompts.cjs');
-const { toAnkiHtml, deckName, escapeHtml } = require('./format.cjs');
-const { createClient } = require('./anki-client.cjs');
+const { toAnkiHtml, deckName, tagsFor, escapeHtml } = require('./format.cjs');
+const { createClient, MODEL_NAME, FIELDS } = require('./anki-client.cjs');
 const { checkCard } = require('./card-checks.cjs');
 
 const WORKER_ID = 'generate-anki-cards-v1';
@@ -25,7 +25,7 @@ const fail = message => { throw new Error(message); };
 function requiredText(value, label) { if (typeof value !== 'string' || !value.trim()) fail(`${label} must not be blank.`); return value; }
 
 function validateSettings(patch, old) {
-  const allowed = new Set(['ankiUrl', 'apiKey', 'rootDeck', 'chunkBudget', 'modelOverride', 'thinkingOverride', 'struggleLapses']);
+  const allowed = new Set(['ankiUrl', 'apiKey', 'deck', 'chunkBudget', 'modelOverride', 'thinkingOverride', 'struggleLapses']);
   for (const key of Object.keys(patch)) if (!allowed.has(key)) fail(`Unsupported setting: ${key}`);
   const s = { ...old, ...patch };
   if (s.thinkingOverride === null) delete s.thinkingOverride;
@@ -35,8 +35,8 @@ function validateSettings(patch, old) {
   s.ankiUrl = String(s.ankiUrl).trim();
   if (typeof s.apiKey !== 'string') fail('API key must be text.');
   s.apiKey = s.apiKey.trim();
-  if (typeof s.rootDeck !== 'string' || !s.rootDeck.replace(/:/g, '').trim()) fail('Root deck must not be blank.');
-  s.rootDeck = s.rootDeck.trim();
+  if (typeof s.deck !== 'string' || !s.deck.replace(/:/g, '').trim()) fail('Anki deck must not be blank.');
+  s.deck = deckName(s.deck);
   if (!Number.isSafeInteger(s.chunkBudget) || s.chunkBudget < 1) fail('Input budget must be a positive safe whole number.');
   if (!Number.isSafeInteger(s.struggleLapses) || s.struggleLapses < 1 || s.struggleLapses > 100) fail('Struggle lapse threshold must be a whole number from 1 to 100.');
   if (s.modelOverride !== null && (!s.modelOverride || typeof s.modelOverride.provider !== 'string' || typeof s.modelOverride.id !== 'string')) fail('Invalid model override.');
@@ -105,7 +105,22 @@ function pack(graph, ids, state) {
 function ankiFields(card) {
   return { Question: toAnkiHtml(card.question), Answer: toAnkiHtml(card.answer), Proposition: escapeHtml(card.propositionName || ''), Source: escapeHtml(card.sourceTitle || ''), LHId: card.id };
 }
+// Hash of a note's fields as Anki holds them. LHId is taken from the card, so a damaged
+// LHId never counts as an edit (it is restored on update). NFC: Anki normalizes text.
+const nfc = fields => Object.fromEntries(Object.entries(fields).map(([k, v]) => [k, String(v).normalize('NFC')]));
+function ankiHashOf(info, cardId) {
+  const fields = Object.fromEntries(FIELDS.map(name => [name, name === 'LHId' ? cardId : info.fields?.[name]?.value ?? '']));
+  return { raw: fingerprint(fields), nfc: fingerprint(nfc(fields)) };
+}
+// Was the note edited in Anki since Anki Bridge last wrote (or kept) it?
+function editedInAnki(info, card) {
+  const baseline = card.ankiHash ?? card.pushedHash;
+  if (!baseline) return false;
+  const now = ankiHashOf(info, card.id);
+  return now.nfc !== baseline && now.raw !== baseline;
+}
 function cardStatus(card) {
+  if (card.conflict) return 'conflict';
   if (!card.pushedHash) return 'new';
   try { return fingerprint(ankiFields(card)) === card.pushedHash ? 'pushed' : 'changed'; } catch { return 'changed'; }
 }
@@ -143,7 +158,7 @@ function activate(ctx, options = {}) {
 
   function view() {
     alive(); const s = store.get();
-    const cards = Object.values(s.cards).sort((a, b) => a.createdAt - b.createdAt).map(c => ({ ...c, status: cardStatus(c), deck: deckName(s.settings.rootDeck, c.sourceTitle) }));
+    const cards = Object.values(s.cards).sort((a, b) => a.createdAt - b.createdAt).map(c => ({ ...c, status: cardStatus(c), tag: tagsFor(c.sourceTitle)[1] }));
     const b = s.batches.at(-1);
     const batch = b ? { ...b, chunks: b.chunks.map(c => {
       if (applicationErrors.has(c.id)) return { ...c, error: applicationErrors.get(c.id) };
@@ -152,7 +167,7 @@ function activate(ctx, options = {}) {
     }), added: b.chunks.reduce((n, c) => n + (c.added || 0), 0), completed: b.chunks.filter(c => TERMINAL.includes(c.status)).length, total: b.chunks.length,
       failedTargetIds: b.chunks.filter(c => ['failed', 'cancelled', 'interrupted'].includes(c.status)).flatMap(c => c.targetIds ?? []),
       error: b.chunks.map(c => applicationErrors.get(c.id)).find(Boolean) } : null;
-    return { revision: s.revision, settings: s.settings, cards, batch, pushing: !!pushing, lastPush };
+    return { revision: s.revision, settings: s.settings, deck: deckName(s.settings.deck), cards, batch, pushing: !!pushing, lastPush };
   }
 
   function finishBatch(s, b) {
@@ -174,7 +189,7 @@ function activate(ctx, options = {}) {
           for (const card of row.cards) {
             const q = card.question.trim(); if (seen.has(q)) continue; seen.add(q);
             const id = randomUUID();
-            s.cards[id] = { id, propositionId: row.propositionId, propositionName: source.name, sourceId: source.sourceId, sourceTitle: source.title, question: card.question, answer: card.answer, createdAt: now, updatedAt: now, ankiNoteId: null, pushedHash: null, pushedAt: null };
+            s.cards[id] = { id, propositionId: row.propositionId, propositionName: source.name, sourceId: source.sourceId, sourceTitle: source.title, question: card.question, answer: card.answer, createdAt: now, updatedAt: now, ankiNoteId: null, pushedHash: null, ankiHash: null, pushedAt: null, conflict: null };
             added++;
           }
         }
@@ -307,41 +322,63 @@ function activate(ctx, options = {}) {
     const decks = await anki.invoke('deckNames');
     return { ok: true, version, deckCount: Array.isArray(decks) ? decks.length : 0 };
   });
+  register('list-decks', async () => {
+    const decks = await client().invoke('deckNames');
+    if (!Array.isArray(decks)) fail('AnkiConnect returned an invalid deck list.');
+    return decks.filter(d => typeof d === 'string').sort((a, b) => a.localeCompare(b));
+  });
 
-  async function push(cardIds) {
-    const s0 = store.get();
-    let targets = Object.values(s0.cards);
+  // Finds the card's note: by LHId, else by the note ID recorded at the last push.
+  async function locate(anki, card) {
+    const found = await anki.findByLhId(card.id);
+    const ids = found.length ? [found[0]] : card.ankiNoteId ? [card.ankiNoteId] : [];
+    if (!ids.length) return null;
+    const [info] = await anki.notesInfo(ids);
+    return info && info.modelName === MODEL_NAME ? info : null;
+  }
+  const record = (id, update) => change(s => { const c = s.cards[id]; if (c) update(c); });
+
+  // force: overwrite a note even if it was edited in Anki (used to resolve a conflict).
+  async function push(cardIds, { force = false } = {}) {
+    let targets = Object.values(store.get().cards);
     if (cardIds !== undefined) {
       if (!Array.isArray(cardIds) || cardIds.some(id => typeof id !== 'string')) fail('Invalid card selection.');
       const wanted = new Set(cardIds); targets = targets.filter(c => wanted.has(c.id));
     }
-    targets = targets.filter(c => cardStatus(c) !== 'pushed');
-    const summary = { at: Date.now(), attempted: targets.length, created: 0, updated: 0, failed: [] };
+    targets = targets.filter(c => force ? cardStatus(c) !== 'pushed' : ['new', 'changed'].includes(cardStatus(c)));
+    const summary = { at: Date.now(), attempted: targets.length, created: 0, updated: 0, conflicts: 0, failed: [], notice: null };
     if (!targets.length) return summary;
     const anki = client();
     await anki.version();
-    await anki.ensureModel();
-    const decksReady = new Set();
+    const model = await anki.ensureModel();
+    if (model.customized) summary.notice = `The "${MODEL_NAME}" note type was customized in Anki, so its template and styling were left unchanged.`;
+    let deckReady = false;
     for (const target of targets) {
       if (disposed || ctx.signal.aborted) break;
       const card = store.get().cards[target.id];
       if (!card) continue; // deleted meanwhile
       try {
-        const fields = ankiFields(card), hash = fingerprint(fields);
-        const found = await anki.findByLhId(card.id);
+        const fields = ankiFields(card), hash = fingerprint(fields), tags = tagsFor(card.sourceTitle);
+        const info = await locate(anki, card);
         let noteId;
-        if (found.length) {
-          noteId = found[0];
-          await anki.updateFields(noteId, fields); summary.updated++;
+        if (info) {
+          if (!force && editedInAnki(info, card)) {
+            record(card.id, c => { c.conflict = { at: Date.now(), question: info.fields?.Question?.value ?? '', answer: info.fields?.Answer?.value ?? '' }; });
+            summary.conflicts++; continue;
+          }
+          noteId = info.noteId;
+          await anki.updateFields(noteId, fields);
+          await anki.addTags([noteId], tags);
+          summary.updated++;
         } else {
-          const deck = deckName(store.get().settings.rootDeck, card.sourceTitle);
-          if (!decksReady.has(deck)) { await anki.ensureDeck(deck); decksReady.add(deck); }
-          noteId = await anki.addNote(deck, fields, ['learnharness']);
+          const deck = deckName(store.get().settings.deck);
+          if (!deckReady) { await anki.ensureDeck(deck); deckReady = true; }
+          noteId = await anki.addNote(deck, fields, tags);
           if (!noteId) fail('Anki did not return a note ID.');
           summary.created++;
         }
         // Record progress per card so an interrupted push resumes correctly.
-        change(s => { const c = s.cards[card.id]; if (c) { c.ankiNoteId = noteId; c.pushedHash = hash; c.pushedAt = Date.now(); } });
+        record(card.id, c => { c.ankiNoteId = noteId; c.pushedHash = hash; c.ankiHash = fingerprint(nfc(fields)); c.pushedAt = Date.now(); c.conflict = null; });
       } catch (error) {
         summary.failed.push({ cardId: card.id, error: error.message });
         if (/not reachable/.test(error.message)) break;
@@ -349,13 +386,31 @@ function activate(ctx, options = {}) {
     }
     return summary;
   }
-  register('push', async ({ cardIds }) => {
+  async function exclusive(run) {
     if (pushing) fail('A push is already running.');
-    pushing = push(cardIds);
+    pushing = run();
     notify();
     try { lastPush = await pushing; }
-    catch (error) { lastPush = { at: Date.now(), attempted: 0, created: 0, updated: 0, failed: [], error: error.message }; throw error; }
+    catch (error) { lastPush = { at: Date.now(), attempted: 0, created: 0, updated: 0, conflicts: 0, failed: [], error: error.message }; throw error; }
     finally { pushing = null; notify(); }
+    return { summary: lastPush, state: view() };
+  }
+  register('push', ({ cardIds }) => exclusive(() => push(cardIds)));
+
+  // A card whose note was edited in Anki: overwrite Anki with this card, or keep Anki's
+  // version (the card counts as in sync until it is edited again here).
+  register('resolve-conflict', async ({ id, keep }) => {
+    const card = (Object.hasOwn(store.get().cards, id) ? store.get().cards[id] : null) ?? fail('Card not found.');
+    if (!card.conflict) fail('This card has no conflict.');
+    if (keep !== 'anki' && keep !== 'local') fail('Choose which version to keep.');
+    if (keep === 'local') return exclusive(() => push([id], { force: true }));
+    if (pushing) fail('A push is already running.');
+    const info = await locate(client(), card);
+    record(id, c => {
+      c.conflict = null;
+      if (!info) return; // note gone: the card stays changed and is recreated on push
+      c.ankiNoteId = info.noteId; c.pushedHash = fingerprint(ankiFields(c)); c.ankiHash = ankiHashOf(info, c.id).nfc;
+    });
     return { summary: lastPush, state: view() };
   });
 
@@ -366,9 +421,9 @@ function activate(ctx, options = {}) {
     let graph = null;
     try { graph = graphNow(); } catch { /* statements are optional context */ }
     const nodes = new Map((graph?.propositions ?? []).map(n => [n.id, n]));
-    const byProposition = new Map();
+    const byProposition = new Map(), byNote = new Map(Object.values(s.cards).filter(c => c.ankiNoteId).map(c => [c.ankiNoteId, c]));
     for (const hit of found) {
-      const card = s.cards[hit.lhId];
+      const card = (Object.hasOwn(s.cards, hit.lhId) ? s.cards[hit.lhId] : null) ?? byNote.get(hit.noteId);
       if (!card) continue; // not (or no longer) an Anki Bridge card
       const entry = byProposition.get(card.propositionId) ?? { propositionId: card.propositionId, name: card.propositionName, statement: nodes.get(card.propositionId)?.statement ?? null, inGraph: nodes.has(card.propositionId), lapses: 0, leech: false, cards: [] };
       entry.lapses += hit.lapses; entry.leech ||= hit.leech;
