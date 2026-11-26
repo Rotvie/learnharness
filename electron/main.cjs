@@ -31,7 +31,10 @@ const { attachChatGPTChild, trustedSender, chatGPTControl } = require("./chatgpt
 const { createSubscriptions, loadSubscriptionSDK } = require("./subscriptions.cjs");
 const { attachSubscriptionChild, subscriptionControl } = require("./subscription-ipc.cjs");
 const { desktopAPIHeaders } = require("./desktop-api.cjs");
+const { createPhoneAccess } = require("./phone-access.cjs");
+const { phoneAccessAdvertiser } = require("./phone-access-bonjour.cjs");
 const { openWebSubscriptionBrowser } = require("./web-subscription-browser.cjs");
+const { APP_USER_AGENT_TOKEN, normalizeServerUrl, insecureRemote, readServerChoice, writeServerChoice, probeServer } = require("./remote-server.cjs");
 const { randomBytes } = require("node:crypto");
 const { spawn } = require("node:child_process");
 const fs = require("node:fs");
@@ -54,6 +57,8 @@ const PRODUCT_NAME = "LearnHarness";
 app.setName(PRODUCT_NAME);
 const AUTH_FILE = () => path.join(app.getPath("userData"), "auth.json");
 const DATA_DIR = () => path.join(app.getPath("userData"), "data");
+/** Local vs self-hosted server choice (electron/remote-server.cjs). */
+const SERVER_FILE = () => path.join(app.getPath("userData"), "server.json");
 
 // Resolve the saved palette before window creation; renderer reports keep
 // it current after live saves. This helper needs no compiled server bundle.
@@ -156,6 +161,11 @@ let subscriptionChild = null;
 let desktopAPISecret = null;
 let reopenWindow = null;
 const trustedAppWindows = new Set();
+let phoneAccess = null;
+
+// The self-hosted server this launch opened, or null when running locally.
+let remoteServerUrl = null;
+let connectWindow = null;
 
 // A GUI shell must never die to a stray exception (EPIPE dialogs, a race
 // in an event handler): the window + child server are the product, and
@@ -317,7 +327,7 @@ function openExternalLink(target) {
  *  - will-navigate pinned to the app origin; window.open always denied —
  *    external links go to the real browser via shell.openExternal, for
  *    http, https and mailto only (openExternalLink). */
-function createWindow(url) {
+function createWindow(url, beforeLoad) {
 	const win = new BrowserWindow({
 		width: 1440,
 		height: 900,
@@ -403,6 +413,7 @@ function createWindow(url) {
 		return { action: "deny" };
 	});
 
+	beforeLoad?.(win);
 	void win.loadURL(url);
 	// Zoom truth reaches the renderer for EVERY load (reload, nav): the
 	// renderer's --lh-zoom must never go stale. The fallback catcher below
@@ -611,6 +622,107 @@ function applyZoom(win, factor) {
 	win.webContents.send("lh:zoom", factor);
 }
 
+/* ── Self-hosted server (docs/self-hosting.md) ────────────────────────────
+ * The server choice is read once at launch; changing it writes
+ * userData/server.json and relaunches, so local-only machinery (the child
+ * server, subscription sign-in, the desktop API capability) is either fully
+ * up or never started — no half-switched state. */
+function switchServer(choice) {
+	writeServerChoice(SERVER_FILE(), choice);
+	log(`server choice → ${choice.mode === "remote" ? choice.url : "local"} (relaunching)`);
+	killServer();
+	app.relaunch();
+	app.exit(0);
+}
+
+async function signOutOfServer() {
+	if (!remoteServerUrl) return;
+	await session.defaultSession.clearStorageData({ origin: remoteServerUrl, storages: ["cookies"] });
+	for (const win of trustedAppWindows) if (!win.isDestroyed()) void win.loadURL(remoteServerUrl);
+}
+
+const fromConnectWindow = (event) => !!connectWindow && !connectWindow.isDestroyed() && event.sender === connectWindow.webContents;
+
+function installConnectHandlers() {
+	ipcMain.handle("lh:connect:current", (event) => {
+		if (!fromConnectWindow(event)) throw new Error("Untrusted request.");
+		return remoteServerUrl ? { mode: "remote", url: remoteServerUrl } : { mode: "local" };
+	});
+	ipcMain.handle("lh:connect:save", async (event, address, allowInsecure) => {
+		if (!fromConnectWindow(event)) throw new Error("Untrusted request.");
+		const { url, error } = normalizeServerUrl(address);
+		if (error) return { error };
+		const probe = await probeServer(url);
+		if (!probe.ok) return { error: probe.error };
+		if (insecureRemote(url) && allowInsecure !== true) {
+			return { warning: "This address uses plain http:// over the internet, so your password would travel unencrypted. Use https:// or Tailscale, or press Connect again to use it anyway." };
+		}
+		setTimeout(() => switchServer({ mode: "remote", url }), 400);
+		return { ok: true };
+	});
+	ipcMain.handle("lh:connect:local", (event) => {
+		if (!fromConnectWindow(event)) throw new Error("Untrusted request.");
+		setTimeout(() => switchServer({ mode: "local" }), 100);
+		return { ok: true };
+	});
+	ipcMain.on("lh:connect:close", (event) => {
+		if (fromConnectWindow(event)) connectWindow.close();
+	});
+}
+
+function openConnectWindow() {
+	if (connectWindow && !connectWindow.isDestroyed()) {
+		connectWindow.focus();
+		return;
+	}
+	const parent = [...trustedAppWindows].find((win) => !win.isDestroyed());
+	connectWindow = new BrowserWindow({
+		width: 480,
+		height: 420,
+		resizable: false,
+		minimizable: false,
+		maximizable: false,
+		title: "Connect to Server",
+		backgroundColor: "#141414",
+		show: false,
+		...(parent ? { parent, modal: process.platform === "darwin" } : {}),
+		...(process.platform === "darwin" ? { titleBarStyle: "hiddenInset" } : {}),
+		webPreferences: { contextIsolation: true, sandbox: true, nodeIntegration: false, preload: path.join(__dirname, "connect-preload.cjs") },
+	});
+	connectWindow.webContents.on("will-navigate", (event) => event.preventDefault());
+	connectWindow.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
+	connectWindow.once("ready-to-show", () => connectWindow?.show());
+	connectWindow.on("closed", () => {
+		connectWindow = null;
+		// Opened from the unreachable-server prompt: nothing else to show.
+		if (trustedAppWindows.size === 0 && !reopenWindow) app.quit();
+	});
+	void connectWindow.loadFile(path.join(__dirname, "connect.html"));
+}
+
+/** Remote server down at launch: retry, pick another address, or go local.
+ *  Resolves true once the server answers; false when the user moved on. */
+async function reachRemoteServer(url) {
+	for (;;) {
+		const probe = await probeServer(url);
+		if (probe.ok) return true;
+		log(`remote server unreachable: ${probe.error}`);
+		const { response } = await dialog.showMessageBox({
+			type: "warning",
+			message: "Can't reach your LearnHarness server",
+			detail: probe.error,
+			buttons: ["Try Again", "Change Server…", "Use This Mac", "Quit"],
+			defaultId: 0,
+			cancelId: 3,
+		});
+		if (response === 0) continue;
+		if (response === 1) openConnectWindow();
+		else if (response === 2) switchServer({ mode: "local" });
+		else app.quit();
+		return false;
+	}
+}
+
 /** macOS needs an application menu with the Edit roles — without one,
  *  Cmd+C/V/A do nothing in the renderer. Everything else stays minimal. */
 function installMenu() {
@@ -621,6 +733,16 @@ function installMenu() {
 				{ role: "about" },
 				// Manual checks report their result in Settings → General.
 				{ label: "Check for Updates…", click: () => checkForUpdatesFromMenu() },
+				{ type: "separator" },
+				// Self-hosting: local bundled server vs a remote one (docs/self-hosting.md).
+				{ label: remoteServerUrl ? `Server: ${new URL(remoteServerUrl).host}` : "Server: This Mac", enabled: false },
+				{ label: "Connect to Server…", click: () => openConnectWindow() },
+				...(remoteServerUrl
+					? [
+						{ label: "Sign Out of Server", click: () => void signOutOfServer() },
+						{ label: "Use This Mac Instead", click: () => switchServer({ mode: "local" }) },
+					]
+					: []),
 				{ type: "separator" },
 				{ role: "hide" },
 				{ role: "hideOthers" },
@@ -690,8 +812,22 @@ async function main() {
 	// spawn, no packaging, full HMR. The rest of this shell still applies
 	// (guards, menu, single instance).
 	const devUrl = process.env.LH_DEV_URL;
-	const url = devUrl ?? `http://127.0.0.1:${await freePort()}`;
-	if (!devUrl) {
+	// Identify the app on every request (a self-hosted server in apps-only
+	// mode refuses anything else). Harmless for the local server.
+	session.defaultSession.setUserAgent(`${session.defaultSession.getUserAgent()} ${APP_USER_AGENT_TOKEN}`);
+	installConnectHandlers();
+	remoteServerUrl = devUrl ? null : (() => {
+		const choice = readServerChoice(SERVER_FILE());
+		return choice.mode === "remote" ? choice.url : null;
+	})();
+	const url = devUrl ?? remoteServerUrl ?? `http://127.0.0.1:${await freePort()}`;
+	if (remoteServerUrl) {
+		// Nothing local starts: no child server, no subscription sign-in, and
+		// no desktop API capability (that header must never leave this Mac).
+		log(`remote server: ${remoteServerUrl}`);
+		installMenu();
+		if (!(await reachRemoteServer(remoteServerUrl))) return;
+	} else if (!devUrl) {
 		desktopAPISecret = randomBytes(32).toString("hex");
 		const ownedOrigin = new URL(url).origin;
 		// All URLs, not only /api: remove the header again on external redirects.
@@ -777,7 +913,15 @@ async function main() {
 	// interval fire after it below. setupAutoUpdater's contract: failures
 	// are log lines — this can never block boot.
 	setupAutoUpdater();
-	ipcMain.on("lh:update-install", () => installUpdateNow());
+	// Same sender rule as lh:update:get/check. ipcMain.on has no reply channel,
+	// so an untrusted request is dropped and logged.
+	ipcMain.on("lh:update-install", (event) => {
+		if (!trustedAppWindows.has(BrowserWindow.fromWebContents(event.sender)) || !trustedSender(event, new URL(url).origin, BrowserWindow)) {
+			log("auto-update: ignored install request from an untrusted sender");
+			return;
+		}
+		installUpdateNow();
+	});
 	ipcMain.handle("lh:update:get", (event) => {
 		if (!trustedAppWindows.has(BrowserWindow.fromWebContents(event.sender)) || !trustedSender(event, new URL(url).origin, BrowserWindow)) throw new Error("Untrusted desktop request.");
 		return updateState;
@@ -810,11 +954,48 @@ async function main() {
 		nativeTheme.themeSource = themeSourceFor(appearance.mode);
 		for (const win of BrowserWindow.getAllWindows()) applyChrome(win);
 	});
+	// Phone access (docs/phone-access.md): a paired-phone HTTPS gateway in
+	// front of THIS app's own server. Only when that server is local or the
+	// dev server; never while connected to a remote server.
+	if (!remoteServerUrl) {
+		const notifyPhoneAccess = () => { for (const win of BrowserWindow.getAllWindows()) if (!win.isDestroyed()) win.webContents.send("lh:phone-access:changed"); };
+		phoneAccess = createPhoneAccess({
+			directory: path.join(app.getPath("userData"), "phone-access"),
+			upstream: () => ({ origin: new URL(url).origin, secret: desktopAPISecret }),
+			advertise: phoneAccessAdvertiser({ onError: (error) => log(`phone access: Bonjour: ${error?.message ?? error}`) }),
+			appVersion: app.getVersion(),
+			onChange: notifyPhoneAccess,
+		});
+		void phoneAccess.startIfEnabled().then((status) => { if (status.error) log(`phone access: ${status.error}`); }, (error) => log(`phone access: ${error?.message ?? error}`));
+		app.on("will-quit", () => { void phoneAccess?.stop(); });
+	}
+	ipcMain.handle("lh:phone-access:control", async (event, command) => {
+		if (!trustedAppWindows.has(BrowserWindow.fromWebContents(event.sender)) || !trustedSender(event, new URL(url).origin, BrowserWindow)) throw new Error("Untrusted desktop request.");
+		if (!phoneAccess) return { available: false };
+		switch (command?.op) {
+			case "status": return { available: true, ...phoneAccess.status() };
+			case "setEnabled": return { available: true, ...(await phoneAccess.setEnabled(command.enabled === true)) };
+			case "newCode": return { available: true, ...phoneAccess.newCode() };
+			case "revoke": phoneAccess.revoke(String(command.id)); return { available: true, ...phoneAccess.status() };
+			default: throw new Error("Unknown phone access command.");
+		}
+	});
+
 	reopenWindow = () => { chatgpt?.resume(); subscriptions?.resume(); return createWindow(url); };
 	app.on("activate", () => {
 		if (BrowserWindow.getAllWindows().length === 0) reopenWindow();
 	});
-	createWindow(url);
+	createWindow(url, firstWindow => {
+		const fromFirstWindow = event => !firstWindow.isDestroyed() && event.sender === firstWindow.webContents &&
+			trustedSender(event, new URL(url).origin, BrowserWindow);
+		let messages;
+		if (app.isPackaged && !devUrl) {
+			const { dismissalStore, startMessages } = require("./startup-messages.cjs");
+			messages = startMessages(firstWindow, dismissalStore(app.getPath("userData")));
+		}
+		ipcMain.handle("lh:startup-message:take", event => messages && fromFirstWindow(event) ? messages.take() : null);
+		ipcMain.handle("lh:startup-message:dismiss", (event, id) => !!messages && fromFirstWindow(event) && messages.dismiss(id));
+	});
 	log(`window open: ${url}`);
 	// Startup + 24h checks stay main-owned and read the current preference.
 	// No renderer subscription is required; late loads retrieve the snapshot.

@@ -44,6 +44,8 @@ ipcRenderer.on("lh:open-settings", (_event, section) => {
 
 contextBridge.exposeInMainWorld("lh", {
 	platform: process.platform,
+	takeStartupMessage: () => ipcRenderer.invoke("lh:startup-message:take"),
+	dismissStartupMessage: (id) => ipcRenderer.invoke("lh:startup-message:dismiss", id),
 	// Resolve only a renderer-supplied, OS-backed File. No filesystem API,
 	// uploads, copies, or DOM File IPC to main; sandbox/isolation stay on.
 	getPathForFile: (file) => webUtils.getPathForFile(file),
@@ -79,6 +81,17 @@ contextBridge.exposeInMainWorld("lh", {
 			const listener = () => cb();
 			ipcRenderer.on("lh:subscriptions:changed", listener);
 			return () => ipcRenderer.removeListener("lh:subscriptions:changed", listener);
+		},
+	},
+	phoneAccess: {
+		status: () => ipcRenderer.invoke("lh:phone-access:control", { op: "status" }),
+		setEnabled: (enabled) => ipcRenderer.invoke("lh:phone-access:control", { op: "setEnabled", enabled }),
+		newCode: () => ipcRenderer.invoke("lh:phone-access:control", { op: "newCode" }),
+		revoke: (id) => ipcRenderer.invoke("lh:phone-access:control", { op: "revoke", id }),
+		onChange: (cb) => {
+			const listener = () => cb();
+			ipcRenderer.on("lh:phone-access:changed", listener);
+			return () => ipcRenderer.removeListener("lh:phone-access:changed", listener);
 		},
 	},
 	expandWindow: () => ipcRenderer.send("lh:expand-window"),

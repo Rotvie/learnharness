@@ -6,6 +6,7 @@
 
 export * from "./chat-handler.ts";
 export * from "./events-stream.ts";
+export { loginResponse, logoutResponse, loginPageResponse } from "./remote-access.ts";
 export * from "./chats.ts";
 export * from "./graph.ts";
 export * from "./source-organization.ts";
@@ -54,6 +55,7 @@ export { runPiTurn, piTurnResponse, type PiTurnHandle, type PiTurnSpec } from ".
 export * from "./observability.ts";
 export { abortPluginWorkerActivity } from "./plugin-worker-activity.ts";
 export * from "./model-catalog.ts";
+export { refreshModelCatalog } from "./remote-model-catalog.ts";
 export { subscriptionControlsResponse, subscriptionBrowserResponse } from "./web-subscription-http.ts";
 export { sessionCost } from "./pricing.ts";
 export { initializePlugins, getPluginHost, getPluginAgentContributions, getPluginQuestionTypeResolver, pluginTransport } from "./plugins.ts";

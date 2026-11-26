@@ -21,6 +21,7 @@
  * switching sections never refetches.
  */
 
+import { NATIVE_OPEN_SETTINGS_EVENT, postToNative } from "@/components/native-shell";
 import {
 	createContext,
 	useCallback,
@@ -33,12 +34,11 @@ import {
 	type ReactNode,
 	type RefObject,
 } from "react";
-import { BotIcon, KeyIcon, KeyboardIcon, PaletteIcon, PlugIcon, PuzzleIcon, SettingsIcon, WaypointsIcon, type LucideIcon } from "lucide-react";
+import { BotIcon, KeyIcon, KeyboardIcon, PaletteIcon, PlugIcon, PuzzleIcon, SettingsIcon, SmartphoneIcon, WaypointsIcon, type LucideIcon } from "lucide-react";
 import { HostDialog } from "@/components/host-dialog";
 import { useInteractionLayers, type CloseOutcome } from "@/components/interaction-layers";
 import {
 	CURRENT_SETTINGS_VERSION,
-	type AgentSettings,
 	type AppearanceSettings,
 	type CompactionSettings,
 	type GraphSettings,
@@ -47,7 +47,8 @@ import {
 import { useAppearance } from "./appearance.tsx";
 import { SettingsSection } from "./controls.tsx";
 import { UpdateSettings } from "./update-settings.tsx";
-import { AgentSection } from "./agent-section.tsx";
+import { PhoneAccessSettings, phoneAccessBridge, type PhoneAccessBridge } from "./phone-access-settings.tsx";
+import { AgentSection, composePromptSwitch } from "./agent-section.tsx";
 import type { ModelsSettings } from "@/src/core";
 import { MENU_CLOSE_EVENT, MENU_OPEN_EVENT } from "@/components/menu-shell";
 import { notifySettingsSaved } from "@/components/settings-signal";
@@ -72,7 +73,7 @@ const SECTIONS = [
 	{ id: "keyboard", label: "Keyboard", icon: KeyboardIcon, hint: "Stored on this device" },
 	{ id: "general", label: "General", icon: SettingsIcon },
 ] as const;
-type SectionId = (typeof SECTIONS)[number]["id"] | "plugins" | "core-plugins" | `plugin:${string}`;
+type SectionId = (typeof SECTIONS)[number]["id"] | "phone" | "plugins" | "core-plugins" | `plugin:${string}`;
 
 /** `open(section?, row?)` — the optional ROW deep-links into the Keys
  *  section with that row unfolded (zero-keys wave: the dictation error's
@@ -87,7 +88,16 @@ interface SettingsWriteOrder {
 	acknowledged: number;
 	record?: UserSettings;
 	fileAccessError?: string | null;
+	pendingWrites: number;
+	promptDeletion?: Promise<void>;
 	listeners: Set<(record: UserSettings, fileAccessError: string | null) => void>;
+}
+const newWriteOrder = (): SettingsWriteOrder => ({ issued: 0, acknowledged: 0, pendingWrites: 0, listeners: new Set() });
+// Settings runs on supported browsers that predate Promise.withResolvers.
+function settingsCompletion() {
+	let resolve!: () => void;
+	const promise = new Promise<void>(done => { resolve = done; });
+	return { promise, resolve };
 }
 const WriteOrderContext = createContext<RefObject<SettingsWriteOrder> | null>(null);
 
@@ -101,7 +111,7 @@ export function SettingsDialogProvider({
 }) {
 	const interactions = useInteractionLayers();
 	const layerId = useId();
-	const writeOrder = useRef<SettingsWriteOrder>({ issued: 0, acknowledged: 0, listeners: new Set() });
+	const writeOrder = useRef(newWriteOrder());
 	const [show, setShow] = useState(false);
 	const [landOn, setLandOn] = useState<SectionId>("keys");
 	const [landOnRow, setLandOnRow] = useState<string | null>(null);
@@ -116,7 +126,11 @@ export function SettingsDialogProvider({
 		setLandOnRow(row ?? null);
 		setShow(true);
 	}, [interactions, layerId]);
-	const close = useCallback((): CloseOutcome => { setShow(false); return "closed"; }, []);
+	const close = useCallback((): CloseOutcome => {
+		setShow(false);
+		postToNative({ type: "settingsClosed" });
+		return "closed";
+	}, []);
 	useEffect(() => window.lh?.onOpenSettings?.((section) => open(section)), [open]);
 	useEffect(() => {
 		const onPluginSettings = (event: Event) => {
@@ -125,6 +139,18 @@ export function SettingsDialogProvider({
 		};
 		window.addEventListener("lh:open-plugin-settings", onPluginSettings);
 		return () => window.removeEventListener("lh:open-plugin-settings", onPluginSettings);
+	}, [open]);
+	// The iPhone app's Settings tab opens a section directly (native-shell.ts);
+	// a request made before this provider mounted waits on the window.
+	useEffect(() => {
+		const onNativeOpen = (e: Event) => open((e as CustomEvent<string | undefined>).detail);
+		window.addEventListener(NATIVE_OPEN_SETTINGS_EVENT, onNativeOpen);
+		const pendingSection = window.lhNativePendingSettings;
+		if (pendingSection !== undefined) {
+			window.lhNativePendingSettings = undefined;
+			open(pendingSection || undefined);
+		}
+		return () => window.removeEventListener(NATIVE_OPEN_SETTINGS_EVENT, onNativeOpen);
 	}, [open]);
 	return (
 		<ChatGPTUIProvider><NativeSubscriptionUIProvider><WriteOrderContext.Provider value={writeOrder}><DialogContext.Provider value={{ open }}>
@@ -187,7 +213,7 @@ export function SettingsDialogBody({
 }) {
 	const { onAppearanceChange } = useAppearance();
 	const inheritedWriteOrder = useContext(WriteOrderContext);
-	const standaloneWriteOrder = useRef<SettingsWriteOrder>({ issued: 0, acknowledged: 0, listeners: new Set() });
+	const standaloneWriteOrder = useRef(newWriteOrder());
 	const writeOrder = inheritedWriteOrder ?? standaloneWriteOrder;
 	const { snapshot } = usePlugins();
 	const [record, setRecord] = useState<UserSettings | null | undefined>(
@@ -248,8 +274,13 @@ export function SettingsDialogBody({
 		if (missingPlugin) setActive(management);
 	}, [missingPlugin, management]);
 	const selected = missingPlugin ? management : active;
+	// Desktop app only (preload bridge); read after mount so SSR and the first
+	// client render agree.
+	const [phoneBridge, setPhoneBridge] = useState<PhoneAccessBridge | undefined>(undefined);
+	useEffect(() => setPhoneBridge(phoneAccessBridge()), []);
 	const navSections: { id: SectionId; label: string; icon?: LucideIcon }[] = [
 		...SECTIONS,
+		...(phoneBridge ? [{ id: "phone" as const, label: "Phone access", icon: SmartphoneIcon }] : []),
 		{ id: "core-plugins", label: "Core plugins", icon: PlugIcon },
 		{ id: "plugins", label: "Community plugins", icon: PuzzleIcon },
 		...enabledPlugins.map(plugin => ({ id: `plugin:${plugin.info.id}` as const, label: plugin.info.manifest?.name ?? plugin.info.id })),
@@ -276,6 +307,10 @@ export function SettingsDialogBody({
 		const applyLoaded = (loaded: UserSettings | null, fileAccessError: string | null = null) => {
 			if (!alive) return;
 			const unchanged = authority.acknowledged === acknowledgedAtRead;
+			if (unchanged && loaded) {
+				authority.record = loaded;
+				authority.fileAccessError = fileAccessError;
+			}
 			setRecord(unchanged ? loaded : authority.record ?? loaded);
 			setFileAccessError(unchanged ? fileAccessError : authority.fileAccessError ?? null);
 		};
@@ -297,8 +332,12 @@ export function SettingsDialogBody({
 		async (
 			section: "general" | "agent" | "models" | "appearance" | "graph" | "compaction",
 			body: object,
+			confirms?: (stored: UserSettings) => boolean,
 		): Promise<boolean> => {
-			const ticket = ++writeOrder.current.issued;
+			const authority = writeOrder.current;
+			while (authority.promptDeletion) await authority.promptDeletion;
+			const ticket = ++authority.issued;
+			authority.pendingWrites++;
 			setError(null);
 			try {
 				const res = await fetch(`/api/settings/${section}`, {
@@ -332,14 +371,39 @@ export function SettingsDialogBody({
 					onAppearanceChange(stored.appearance);
 				}
 				notifySettingsSaved(section);
-				return true;
+				return confirms?.(stored) ?? true;
 			} catch (error) {
 				if (ticket === writeOrder.current.issued) setError(`${section}: ${error instanceof Error ? error.message : String(error)}`);
 				return false;
+			} finally {
+				authority.pendingWrites--;
 			}
 		},
 		[onAppearanceChange, writeOrder],
 	);
+
+	async function deletePromptOverride(path: string, remove: () => Promise<boolean>) {
+		const authority = writeOrder.current;
+		// DELETE only acknowledges a key removal. Don't patch a mirror that
+		// hasn't seen preceding full-record ACKs, and never queue a delete.
+		if (authority.promptDeletion || authority.pendingWrites) return "settings-busy" as const;
+		const settled = settingsCompletion();
+		authority.promptDeletion = settled.promise;
+		try {
+			if (!await remove()) return "delete-failed" as const;
+			const stored = authority.record;
+			if (stored?.agent?.prompts?.[path] !== undefined) {
+				const patched = { ...stored, agent: composePromptSwitch(stored.agent, path, false) };
+				authority.acknowledged = ++authority.issued;
+				authority.record = patched;
+				for (const apply of authority.listeners) apply(patched, authority.fileAccessError ?? null);
+			}
+			return "deleted" as const;
+		} finally {
+			authority.promptDeletion = undefined;
+			settled.resolve();
+		}
+	}
 
 	const frame = (
 		<div
@@ -348,7 +412,7 @@ export function SettingsDialogBody({
 			aria-modal="true"
 			aria-label="Settings"
 			data-testid="settings-dialog"
-			className="settings-dialog-pop flex h-[620px] max-h-[85vh] w-[920px] max-w-[90vw] flex-col overflow-hidden rounded-md border border-border bg-card shadow-xl"
+			className="lh-settings-dialog settings-dialog-pop flex h-[620px] max-h-[85vh] w-[920px] max-w-[90vw] flex-col overflow-hidden rounded-md border border-border bg-card shadow-xl"
 			onClick={(e) => e.stopPropagation()}
 		>
 			{/* Header — the app's quiet CMU title language. */}
@@ -380,17 +444,17 @@ export function SettingsDialogBody({
 					</Hint>
 			</header>
 
-			<div className="flex min-h-0 flex-1">
+			<div className="lh-settings-body flex min-h-0 flex-1">
 				{/* Left nav — mono labels and theme-inherited decorative icons,
 					    active = bg-accent. */}
 				<nav
 					aria-label="Settings sections"
 					data-testid="settings-nav"
-					className="flex min-h-0 w-48 shrink-0 flex-col gap-1 overflow-y-auto border-r border-border p-2"
+					className="lh-settings-nav flex min-h-0 w-48 shrink-0 flex-col gap-1 overflow-y-auto border-r border-border p-2"
 				>
 					{navSections.map((s, index) => (
 						<div key={s.id} className="shrink-0">
-							{index === SECTIONS.length && <hr className="my-2 border-border" />}
+							{s.id === "core-plugins" && <hr className="my-2 border-border" />}
 							<button
 								type="button"
 								data-testid={`settings-nav-${s.id}`}
@@ -456,6 +520,11 @@ export function SettingsDialogBody({
 									/>
 								</SettingsSection>
 							)}
+							{active === "phone" && phoneBridge && (
+								<SettingsSection title="Phone access" testid="section-phone">
+									<PhoneAccessSettings bridge={phoneBridge} />
+								</SettingsSection>
+							)}
 							{active === "keys" && (
 								<SettingsSection title="Providers" testid="section-keys">
 									<KeysSection initialRow={initialRow ?? undefined} />
@@ -475,9 +544,10 @@ export function SettingsDialogBody({
 										onModelsChange={(next: ModelsSettings) =>
 											void write("models", next)
 										}
-										onSectionChange={(next: AgentSettings) =>
-											write("agent", next)
+										onSectionChange={(next, confirms) =>
+											write("agent", next, confirms && (stored => confirms(stored.agent ?? {})))
 										}
+										onDeletePromptOverride={deletePromptOverride}
 										onCompactionChange={(next: CompactionSettings) =>
 											write("compaction", next)
 										}

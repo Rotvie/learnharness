@@ -214,11 +214,11 @@ export function wrapRegionLabel(
 			if (!line) {
 				// The word alone overflows: char-split it, the remainder stays
 				// pending for the next line (paths have no spaces to help).
+				const chars = graphemes(word);
 				let chunk = "";
-				while (word.length > 0 && measure(chunk + word[0]) <= maxWidth) {
-					chunk += word[0];
-					word = word.slice(1);
-				}
+				let used = 0;
+				while (used < chars.length && measure(chunk + chars[used]) <= maxWidth) chunk += chars[used++];
+				word = chars.slice(used).join("");
 				if (chunk) {
 					lines.push(chunk);
 					pending[0] = word;
@@ -244,10 +244,17 @@ export function wrapRegionLabel(
 		lines.push(rest);
 		return lines;
 	}
-	let tail = rest;
-	while (tail.length > 1 && measure(`${tail}…`) > maxWidth) tail = tail.slice(0, -1);
-	lines.push(`${tail}…`);
+	const tail = graphemes(rest);
+	while (tail.length > 1 && measure(`${tail.join("")}…`) > maxWidth) tail.pop();
+	lines.push(`${tail.join("")}…`);
 	return lines;
+}
+
+const graphemeSegmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" });
+/** The user-perceived characters of `s` (emoji, flags and accented letters
+ *  stay whole) — the only safe units to split a label between. */
+function graphemes(s: string): string[] {
+	return Array.from(graphemeSegmenter.segment(s), (g) => g.segment);
 }
 
 /** Label-only cluster patch (rename-shuffle fix, 2026-09-23): apply a set
@@ -308,6 +315,10 @@ const ZOOM_EASE_MS = 45; // wheel-zoom glide: exponential-ease time constant (~2
 /** Extra pickable radius (px) beyond the disc — the whole halo is
  *  hit-testable (the old flicker fix, minus the picking shader). */
 const PICKING_PAD = 10;
+/** A fingertip is far less precise than a cursor: on touch screens (the
+ *  iPhone app) a tap picks the nearest node within this many pixels. */
+const TOUCH_PICKING_PAD = 22;
+const COARSE_POINTER = typeof matchMedia !== "undefined" && matchMedia("(pointer: coarse)").matches;
 
 /** Click vs drag threshold: pointer travel under this many px is a click. */
 const CLICK_SLOP = 4;
@@ -532,7 +543,7 @@ function wrapLabel(context: CanvasRenderingContext2D, text: string, maxWidth: nu
 			}
 		}
 		let chunk = "";
-		for (const char of word) {
+		for (const char of graphemes(word)) {
 			if (chunk && context.measureText(`${chunk}${char}`).width > maxWidth) {
 				lines.push(chunk);
 				chunk = char;
@@ -1077,7 +1088,7 @@ export class GraphCanvasRenderer {
 		// nodeSize is world units now (2026-09-15): the on-screen hit radius
 		// is the disc's world radius × the camera zoom, plus the constant
 		// screen pad — the whole halo stays hit-testable.
-		const maxDist = this.settings.nodeSize * k + PICKING_PAD;
+		const maxDist = this.settings.nodeSize * k + (COARSE_POINTER ? TOUCH_PICKING_PAD : PICKING_PAD);
 		const projected: { id: string; x: number; y: number }[] = [];
 		for (const n of this.data.nodes) {
 			if (this.visible && !this.visible.has(n.id)) continue;

@@ -33,7 +33,7 @@ Instead of just giving you an explanation, it uses your answers and thinking to 
 
 **Bring your files.** In the desktop app, attach PDFs, photos, or any other file with the paperclip, or drag them in. The file stays where it is: the message carries its path, and the agent reads it from there.
 
-The agent can also research questions in the background, create visual explanations, show your own images in the lesson and mark them up with arrows and labels, and build interactive demonstrations.
+The agent can also research questions in the background, create visual explanations, show your own images in the lesson and mark them up with arrows and labels (including figures it crops straight out of your PDFs, such as lecture slides), and build interactive demonstrations.
 
 ## Knowledge that carries forward
 
@@ -56,6 +56,21 @@ Choose your models, then start a session with what you want to understand. You c
 See [Getting started](docs/getting-started.md) for model setup, dictation, files, and notes imports, and [context, caching, and costs](docs/compaction-accounting.md) for advanced cache preferences.
 
 All three platforms support in-app updates.
+
+## On your iPhone
+
+The iPhone app uses LearnHarness on your computer: the same sessions, knowledge graph, and settings, served by the desktop app over your local network. Nothing is copied or synced.
+
+<p align="center">
+  <img src="docs/assets/ios-session.png" alt="A teaching session on the iPhone" width="250">
+  <img src="docs/assets/ios-sessions.png" alt="The session list on the iPhone" width="250">
+  <img src="docs/assets/ios-pair.png" alt="Pairing the iPhone with a QR code" width="250">
+</p>
+
+1. On the computer, turn on **Settings → Phone access**. A QR code appears.
+2. Scan it with the iPhone. The phone stays paired until you revoke it.
+
+Keep LearnHarness open and the computer awake while you use the phone; a reply keeps generating on the computer if you leave the app. Both devices need the same network, or Tailscale away from home. For now the iPhone app is built from source with Xcode: see [the iPhone app](docs/ios.md) for setup and [Phone access](docs/phone-access.md) for how pairing is secured.
 
 ## Your keys, your data
 

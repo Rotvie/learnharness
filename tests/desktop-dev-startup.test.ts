@@ -110,7 +110,7 @@ function boot() {
 	const readiness = new Promise<void>((resolve, reject) => { ready = resolve; fail = reject; });
 	const windows: string[] = [], exits: number[] = [], logs: string[] = [], probes: { url: string; signal: AbortSignal }[] = [];
 	const app = Object.assign(new EventEmitter(), {
-		setName() {}, getPath: () => "/fixture/LearnHarness", setPath() {}, requestSingleInstanceLock: () => false,
+		setName() {}, getVersion: () => "0.0.0-test", getPath: () => "/fixture/LearnHarness", setPath() {}, requestSingleInstanceLock: () => false,
 		quit() {}, whenReady: async () => {}, exit: (code: number) => exits.push(code), isPackaged: false,
 	});
 	class FakeWindow extends EventEmitter {
@@ -120,7 +120,7 @@ function boot() {
 	const electron = {
 		app, BrowserWindow: FakeWindow, nativeTheme: { themeSource: "system" }, ipcMain: Object.assign(new EventEmitter(), { handle() {} }),
 		Menu: { buildFromTemplate() {}, setApplicationMenu() {} },
-		session: { defaultSession: { setPermissionRequestHandler() {}, setPermissionCheckHandler() {} } },
+		session: { defaultSession: { setPermissionRequestHandler() {}, setPermissionCheckHandler() {}, getUserAgent: () => "Electron", setUserAgent() {} } },
 	};
 	const context = {
 		require: (id: string) => id === "electron" ? electron : id === "node:fs" ? { mkdirSync() {}, appendFileSync() {} }
